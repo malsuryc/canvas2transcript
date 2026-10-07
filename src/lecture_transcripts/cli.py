@@ -67,8 +67,13 @@ def audio_hash(path: Path) -> str:
 
 
 def run_command(
-    arguments: list[str], failure_message: str, environment: dict | None = None
+    arguments: list[str],
+    failure_message: str,
+    environment: dict | None = None,
+    progress: tuple[str, float] | None = None,
 ) -> str:
+    if progress is not None:
+        return run_progress_command(arguments, failure_message, environment, *progress)
     try:
         result = subprocess.run(
             arguments, capture_output=True, text=True, check=False, env=environment
@@ -82,14 +87,70 @@ def run_command(
     return result.stdout
 
 
-def probe_audio(path: Path) -> dict:
+def run_progress_command(
+    arguments: list[str],
+    failure_message: str,
+    environment: dict | None,
+    description: str,
+    duration: float,
+) -> str:
+    from tqdm import tqdm
+
+    command = [arguments[0], "-progress", "pipe:1", "-nostats", *arguments[1:]]
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            env=environment,
+        )
+    except FileNotFoundError:
+        raise CliError(f"Required tool not found: {Path(arguments[0]).name}.") from None
+    except OSError:
+        raise CliError(failure_message) from None
+    try:
+        with tqdm(
+            total=duration,
+            desc=description,
+            unit="s",
+            ascii=True,
+            dynamic_ncols=True,
+            disable=not sys.stderr.isatty(),
+        ) as bar:
+            for line in process.stdout:
+                key, separator, value = line.strip().partition("=")
+                if key != "out_time_us" or not separator:
+                    continue
+                try:
+                    seconds = max(0.0, min(duration, int(value) / 1_000_000))
+                except ValueError:
+                    continue
+                if seconds > bar.n:
+                    bar.update(seconds - bar.n)
+            if process.wait():
+                raise CliError(failure_message)
+            bar.update(duration - bar.n)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        process.stdout.close()
+    return ""
+
+
+def probe_audio(path: Path | str) -> dict:
     output = run_command(
         [
             "ffprobe",
             "-v",
             "error",
             "-show_entries",
-            "format=duration,size:stream=codec_name,codec_type,sample_rate,channels",
+            "format=duration,size,start_time:stream=codec_name,codec_type,sample_rate,channels,start_time",
             "-of",
             "json",
             str(path),
@@ -105,6 +166,22 @@ def probe_audio(path: Path) -> dict:
     if not has_audio or not math.isfinite(duration) or duration <= 0:
         raise CliError("The input must contain audio with a known positive duration.")
     return media
+
+
+def initial_audio_delay(media: dict) -> float:
+    try:
+        reference = float(media["format"].get("start_time", 0))
+        audio = next(
+            stream for stream in media["streams"] if stream["codec_type"] == "audio"
+        )
+        audio_start = float(audio.get("start_time", reference))
+    except (ValueError, KeyError, TypeError, StopIteration):
+        raise CliError(
+            "Could not determine the recording's initial audio timing."
+        ) from None
+    if not math.isfinite(reference) or not math.isfinite(audio_start):
+        raise CliError("The recording returned invalid initial audio timestamps.")
+    return max(0.0, audio_start - reference)
 
 
 def check_outputs(paths: list[Path], overwrite: bool) -> None:
@@ -206,14 +283,24 @@ def clip_audio(options: argparse.Namespace) -> None:
         source_page = clean_source_page(captured.page_url)
     output.parent.mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
+    leading_silence = 0.0
+    if options.start == 0:
+        print("Inspecting the recording's initial audio timing...", flush=True)
+        leading_silence = initial_audio_delay(probe_audio(source))
+    timing_filter = (
+        f"asetpts=PTS-STARTPTS,adelay={leading_silence * 1000:.6f}:all=1"
+        if options.start == 0
+        else "aresample=async=1:first_pts=0"
+    )
     with tempfile.TemporaryDirectory(
         prefix=".lecture-clip-", dir=output.parent
     ) as directory:
         staged = Path(directory) / output.name
-        codec = (
-            ["-c:a", "copy"]
-            if output.suffix.lower() == ".m4a"
-            else [
+        if output.suffix.lower() == ".wav":
+            processing = "pcm_conversion"
+            codec = [
+                "-af",
+                timing_filter,
                 "-c:a",
                 "pcm_s16le",
                 "-ar",
@@ -221,7 +308,31 @@ def clip_audio(options: argparse.Namespace) -> None:
                 "-ac",
                 "1",
             ]
+        elif options.start == 0:
+            processing = "aac_reencode"
+            codec = [
+                "-af",
+                timing_filter,
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+            ]
+        else:
+            processing = "aac_stream_copy"
+            codec = ["-c:a", "copy"]
+        description = (
+            "Downloading audio"
+            if source_identity["kind"] == "remote"
+            else "Clipping audio"
+            if processing == "aac_stream_copy"
+            else "Converting audio"
         )
+        print(
+            f"{description}: {options.end - options.start:.3f}s of the recording.",
+            flush=True,
+        )
+        seek = ["-ss", str(options.start)] if options.start > 0 else []
         run_command(
             [
                 "ffmpeg",
@@ -230,8 +341,7 @@ def clip_audio(options: argparse.Namespace) -> None:
                 "-n",
                 "-rw_timeout",
                 "20000000",
-                "-ss",
-                str(options.start),
+                *seek,
                 "-i",
                 source,
                 "-t",
@@ -243,12 +353,14 @@ def clip_audio(options: argparse.Namespace) -> None:
                 str(staged),
             ],
             "Audio extraction failed. Refresh expired signed URLs; try WAV if the source audio is not AAC.",
+            progress=(description, options.end - options.start),
         )
         media = probe_audio(staged)
         duration = float(media["format"]["duration"])
         if abs(duration - (options.end - options.start)) > 0.25:
             raise CliError(
-                "Clip duration did not match the requested range. No completed clip was saved."
+                f"Clip duration was {duration:.3f}s; requested {options.end - options.start:.3f}s "
+                f"(difference {duration - (options.end - options.start):+.3f}s). No completed clip was saved."
             )
         staged_metadata = Path(directory) / metadata_path.name
         write_json(
@@ -263,6 +375,8 @@ def clip_audio(options: argparse.Namespace) -> None:
                 "audio_file": output.name,
                 "audio_sha256": audio_hash(staged),
                 "audio": media,
+                "audio_processing": processing,
+                "leading_silence_seconds": leading_silence,
                 "clip_wall_seconds": round(time.perf_counter() - started, 3),
                 "timestamp_note": "Requested source offsets; AAC stream-copy boundaries are approximate.",
             },

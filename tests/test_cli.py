@@ -3,9 +3,11 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
+import wave
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -19,9 +21,12 @@ from lecture_transcripts.browser import (
 from lecture_transcripts.cli import (
     CliError,
     cached_model,
+    initial_audio_delay,
     main,
     parse_time,
+    probe_audio,
     run_command,
+    run_progress_command,
     validate_transcript,
     validate_url,
 )
@@ -49,7 +54,7 @@ class CliTests(unittest.TestCase):
             str(self.output),
         ]
 
-    def fake_media(self, arguments, failure_message, environment=None):
+    def fake_media(self, arguments, failure_message, environment=None, progress=None):
         if arguments[0] == "ffmpeg":
             Path(arguments[-1]).write_bytes(b"clipped audio")
             return ""
@@ -112,6 +117,107 @@ class CliTests(unittest.TestCase):
         metadata = json.loads(self.output.with_suffix(".metadata.json").read_text())
         self.assertEqual(metadata["source_start_seconds"], 10)
         self.assertEqual(metadata["source_end_seconds"], 12)
+
+    def test_zero_start_aac_preserves_initial_timestamp_gap(self):
+        arguments = self.clip_arguments()
+        arguments[arguments.index("--start") + 1] = "0"
+        arguments[arguments.index("--end") + 1] = "2"
+        with patch(
+            "lecture_transcripts.cli.run_command", side_effect=self.fake_media
+        ) as command:
+            self.assertEqual(self.invoke(arguments), 0)
+        extraction = next(
+            call for call in command.call_args_list if call.args[0][0] == "ffmpeg"
+        )
+        self.assertIn("asetpts=PTS-STARTPTS,adelay=0.000000:all=1", extraction.args[0])
+        self.assertEqual(
+            extraction.args[0][extraction.args[0].index("-c:a") + 1], "aac"
+        )
+        self.assertEqual(extraction.kwargs["progress"], ("Converting audio", 2))
+        metadata = json.loads(self.output.with_suffix(".metadata.json").read_text())
+        self.assertEqual(metadata["audio_processing"], "aac_reencode")
+
+    def test_initial_audio_delay_is_relative_to_recording_start(self):
+        media = {
+            "format": {"start_time": "1.4"},
+            "streams": [
+                {"codec_type": "video", "start_time": "1.4"},
+                {"codec_type": "audio", "start_time": "2.235"},
+            ],
+        }
+        self.assertAlmostEqual(initial_audio_delay(media), 0.835)
+
+    def test_nonzero_aac_clip_still_uses_stream_copy(self):
+        with patch(
+            "lecture_transcripts.cli.run_command", side_effect=self.fake_media
+        ) as command:
+            self.assertEqual(self.invoke(self.clip_arguments()), 0)
+        extraction = command.call_args_list[0]
+        self.assertNotIn("-af", extraction.args[0])
+        self.assertEqual(
+            extraction.args[0][extraction.args[0].index("-c:a") + 1], "copy"
+        )
+
+    def test_ffmpeg_progress_uses_audio_seconds_without_raw_errors(self):
+        process = MagicMock()
+        process.stdout = io.StringIO(
+            "out_time_us=500000\nout_time_us=1500000\nprogress=end\n"
+        )
+        process.wait.return_value = 0
+        process.poll.return_value = 0
+        bar = MagicMock()
+        bar.n = 0.0
+        bar.update.side_effect = lambda amount: setattr(bar, "n", bar.n + amount)
+        with patch(
+            "lecture_transcripts.cli.subprocess.Popen", return_value=process
+        ) as launch:
+            with patch("tqdm.tqdm") as progress:
+                progress.return_value.__enter__.return_value = bar
+                run_progress_command(
+                    ["ffmpeg", "-i", "https://media.invalid/?token=SECRET"],
+                    "Extraction failed.",
+                    None,
+                    "Downloading audio",
+                    2,
+                )
+        self.assertEqual(bar.n, 2)
+        self.assertEqual(launch.call_args.kwargs["stderr"], subprocess.DEVNULL)
+        self.assertIn("pipe:1", launch.call_args.args[0])
+        self.assertNotIn("SECRET", str(progress.call_args))
+
+    def test_ffmpeg_progress_failure_does_not_complete_bar(self):
+        process = MagicMock()
+        process.stdout = io.StringIO("out_time_us=500000\n")
+        process.wait.return_value = 1
+        process.poll.return_value = 1
+        bar = MagicMock()
+        bar.n = 0.0
+        bar.update.side_effect = lambda amount: setattr(bar, "n", bar.n + amount)
+        with (
+            patch("lecture_transcripts.cli.subprocess.Popen", return_value=process),
+            patch("tqdm.tqdm") as progress,
+        ):
+            progress.return_value.__enter__.return_value = bar
+            with self.assertRaisesRegex(CliError, "Extraction failed"):
+                run_progress_command(
+                    ["ffmpeg"], "Extraction failed.", None, "Downloading audio", 2
+                )
+        self.assertEqual(bar.n, 0.5)
+
+    def test_ffmpeg_progress_cancellation_terminates_process(self):
+        process = MagicMock()
+        process.stdout.__iter__.side_effect = KeyboardInterrupt
+        process.poll.return_value = None
+        with (
+            patch("lecture_transcripts.cli.subprocess.Popen", return_value=process),
+            patch("tqdm.tqdm"),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            run_progress_command(
+                ["ffmpeg"], "Extraction failed.", None, "Downloading audio", 2
+            )
+        process.terminate.assert_called_once()
+        process.stdout.close.assert_called_once()
 
     def test_local_clip_preserves_original_source_offset(self):
         with patch("lecture_transcripts.cli.run_command", side_effect=self.fake_media):
@@ -512,6 +618,92 @@ class CliTests(unittest.TestCase):
                 1,
             )
         self.assertEqual(list(output_dir.iterdir()), [])
+
+
+@unittest.skipUnless(
+    shutil.which("ffmpeg") and shutil.which("ffprobe"),
+    "Real media tests require FFmpeg and ffprobe.",
+)
+class FFmpegClipTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.source = self.root / "delayed-audio.ts"
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-nostdin",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=160x90:r=25:d=3",
+                "-itsoffset",
+                "0.835",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100:duration=2.165",
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c:v",
+                "mpeg2video",
+                "-c:a",
+                "aac",
+                "-f",
+                "mpegts",
+                str(self.source),
+            ],
+            capture_output=True,
+            check=True,
+        )
+
+    def invoke(self, output, end="2"):
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            return main(
+                [
+                    "clip",
+                    "--input",
+                    str(self.source),
+                    "--start",
+                    "0",
+                    "--end",
+                    end,
+                    "--out",
+                    str(output),
+                ]
+            )
+
+    def test_zero_start_aac_with_delayed_audio_has_requested_duration(self):
+        output = self.root / "clip.m4a"
+        self.assertEqual(self.invoke(output), 0)
+        self.assertAlmostEqual(
+            float(probe_audio(output)["format"]["duration"]), 2.0, places=2
+        )
+
+    def test_wav_preserves_silence_before_first_source_audio(self):
+        output = self.root / "clip.wav"
+        self.assertEqual(self.invoke(output), 0)
+        with wave.open(str(output), "rb") as audio:
+            self.assertEqual(audio.getframerate(), 16000)
+            self.assertEqual(audio.getnframes(), 32000)
+            initial = audio.readframes(4000)
+            self.assertEqual(initial, bytes(len(initial)))
+            remaining = audio.readframes(28000)
+            self.assertNotEqual(remaining, bytes(len(remaining)))
+
+    def test_padding_does_not_hide_truncated_recording(self):
+        output = self.root / "truncated.m4a"
+        self.assertEqual(self.invoke(output, end="5"), 1)
+        self.assertFalse(output.exists())
+        self.assertFalse(output.with_suffix(".metadata.json").exists())
 
 
 @unittest.skipUnless(
