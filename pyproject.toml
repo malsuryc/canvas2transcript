@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Clip authorized lecture audio and transcribe it locally."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
-dependencies = ["whisper-ctranslate2==0.5.8"]
+dependencies = ["whisper-ctranslate2==0.5.8", "tqdm>=4.66,<5"]
 license = "MIT"
 license-files = ["LICENSE", "LICENSE.txt"]
 
