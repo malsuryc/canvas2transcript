@@ -1,0 +1,4 @@
+include requirements.in
+include requirements.txt
+include .python-version
+include .gitignore
