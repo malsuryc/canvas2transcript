@@ -2,7 +2,7 @@
 
 Clip HKUST Canvas lectures and turn the audio into English transcripts locally.
 
-[Install](#install) | [Clip](#clip-a-lecture) | [Transcribe](#transcribe) | [Other commands](#other-commands)
+[Install](#install) | [Clip](#clip-a-lecture) | [Transcribe](#transcribe) | [Models](#models-and-tested-hardware) | [Other commands](#other-commands)
 
 ## Install
 
@@ -62,6 +62,20 @@ lecture-transcripts transcribe data/lecture.m4a \
 
 Its text transcript is saved at `transcripts/medium.en/lecture/lecture.txt`.
 Review equations and technical terms against the audio and slides.
+
+## Models and tested hardware
+
+Uses pretrained English [Whisper](https://github.com/openai/whisper) models ([ctranslate2](https://github.com/Softcatala/whisper-ctranslate2)) through
+`faster-whisper`, running locally on CPU with `int8`. No GPU is required.
+
+- `small.en`: default, faster option; tested on lecture audio.
+- `medium.en`: larger alternative that may improve recognition; not yet benchmarked here.
+
+**Tested example:** Fedora, AMD Ryzen AI 7 PRO 450 (8 cores,
+16 threads), and about 27 GiB usable RAM. Using `small.en` with 8 CPU threads,
+28:15 of audio took about **2:45** and peaked at **1.8 GiB process memory**.
+Note that this is one measured example, not a minimum
+hardware requirement. Speed and accuracy depend on the machine and recording.
 
 ## Other commands
 
