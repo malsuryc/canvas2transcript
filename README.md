@@ -2,7 +2,7 @@
 
 Clip HKUST Canvas lectures and turn the audio into English transcripts locally.
 
-[Install](#install) | [Clip](#clip-a-lecture) | [Transcribe](#transcribe) | [Models](#models-and-tested-hardware) | [Other commands](#other-commands)
+[Install](#install) | [Clip](#clip-a-lecture) | [Transcribe](#transcribe) | [Models](#models-and-tested-hardware) | [Other commands](#other-commands) | [Responsible use](#responsible-use)
 
 ## Install
 
@@ -114,3 +114,9 @@ replace it deliberately.
 
 Only use recordings you are allowed to access. Do not share signed URLs, cookies,
 or the helper browser's login profile.
+
+## Responsible use
+
+This is an independent project, not affiliated with or endorsed by HKUST, Instructure/Canvas, Microsoft, or OpenAI.
+Use only recordings you are authorized and permitted to download and process. Follow applicable copyright, privacy, course policies, and platform terms; access does not automatically permit redistribution.
+Do not use this tool to bypass access controls. Transcripts may contain errors; verify important content against the recording and slides.
