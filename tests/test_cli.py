@@ -2,12 +2,20 @@ import argparse
 import contextlib
 import io
 import json
+import os
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+from lecture_transcripts.browser import (
+    BrowserSource,
+    MediaDiscoveryError,
+    get_browser_source,
+    signed_master_url,
+    wait_for_source,
+)
 from lecture_transcripts.cli import (
     CliError,
     cached_model,
@@ -187,6 +195,139 @@ class CliTests(unittest.TestCase):
             with self.assertRaises(CliError) as error:
                 run_command(["ffmpeg"], "Extraction failed.")
         self.assertNotIn("SECRET_TOKEN", str(error.exception))
+
+    def test_browser_source_accepts_current_signed_master(self):
+        url = "https://ptz143.ust.hk/rvcsecured/mp4:lecture.mp4/playlist.m3u8?rvctokenendtime=2000&rvctokenhash=SECRET_TOKEN"
+        self.assertEqual(signed_master_url(url, now=1000), url)
+        self.assertNotIn(
+            "SECRET_TOKEN", repr(BrowserSource(url, "https://canvas.ust.hk/"))
+        )
+
+    def test_browser_source_rejects_expired_or_untrusted_urls(self):
+        base = "https://ptz143.ust.hk/rvcsecured/mp4:lecture.mp4/playlist.m3u8?rvctokenendtime=2000&rvctokenhash=SECRET_TOKEN"
+        for url in [
+            base.replace("2000", "999"),
+            base.replace("2000", "nan"),
+            base.replace("2000", "inf"),
+            base.replace("ptz143.ust.hk", "evilust.hk"),
+            base.replace("ptz143.ust.hk", "ust.hk.example.invalid"),
+            base.replace("https://", "http://"),
+            base.replace("https://", "https://user:password@"),
+            base.replace("playlist.m3u8", "chunklist_w123_tkSECRET.m3u8"),
+            base.replace("rvctokenhash=SECRET_TOKEN", "rvctokenhash="),
+            base + "&rvctokenendtime=3000",
+            "https://login.microsoftonline.com/",
+        ]:
+            with self.subTest(url=url):
+                self.assertIsNone(signed_master_url(url, now=1000))
+
+    def browser_fixture(self):
+        factory = MagicMock()
+        context = factory.return_value.__enter__.return_value.chromium.launch_persistent_context.return_value
+        page = context.new_page.return_value
+        page.url = "https://canvas.ust.hk/courses/123/pages/lecture"
+        page.is_closed.return_value = False
+        frame = MagicMock()
+        page.frames = [frame]
+        url = "https://ptz143.ust.hk/rvcsecured/mp4:lecture.mp4/playlist.m3u8?rvctokenendtime=4102444800&rvctokenhash=SECRET_TOKEN"
+        frame.evaluate.return_value = [url]
+        return factory, context, page, frame, url
+
+    def test_browser_waits_through_login_before_returning_source(self):
+        factory, context, page, frame, url = self.browser_fixture()
+        frame.evaluate.side_effect = [[], [], [url]]
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = get_browser_source(
+                profile_dir=self.root / "profile", sync_playwright_factory=factory
+            )
+        self.assertEqual(result.url, url)
+        self.assertEqual(page.wait_for_timeout.call_count, 2)
+        context.close.assert_called_once()
+        factory.return_value.__enter__.return_value.chromium.launch_persistent_context.assert_called_once_with(
+            user_data_dir=str(self.root / "profile"),
+            headless=False,
+        )
+        self.assertEqual((self.root / "profile").stat().st_mode & 0o777, 0o700)
+
+    def test_browser_cancellation_is_clear_and_closes_owned_context(self):
+        factory, context, page, frame, url = self.browser_fixture()
+        page.is_closed.return_value = True
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(MediaDiscoveryError, "closed"),
+        ):
+            get_browser_source(
+                profile_dir=self.root / "profile", sync_playwright_factory=factory
+            )
+        context.close.assert_called_once()
+
+    def test_browser_closed_during_event_wait_reports_cancellation(self):
+        factory, context, page, frame, url = self.browser_fixture()
+        frame.evaluate.return_value = []
+        page.is_closed.side_effect = [False, True]
+        page.wait_for_timeout.side_effect = RuntimeError("closed")
+        with self.assertRaisesRegex(MediaDiscoveryError, "closed"):
+            wait_for_source(context, page)
+
+    def test_browser_timeout_does_not_succeed_on_login_state(self):
+        factory, context, page, frame, url = self.browser_fixture()
+        frame.evaluate.return_value = []
+        with patch("lecture_transcripts.browser.time.monotonic", side_effect=[0, 2]):
+            with self.assertRaisesRegex(MediaDiscoveryError, "Timed out"):
+                wait_for_source(context, page, timeout=1)
+
+    def test_browser_can_capture_successful_media_response(self):
+        factory, context, page, frame, url = self.browser_fixture()
+        frame.evaluate.return_value = []
+        response = MagicMock()
+        response.status = 200
+        response.url = url
+        response.request.frame.page = page
+        context.on.side_effect = lambda event, callback: callback(response)
+        self.assertEqual(wait_for_source(context, page).url, url)
+
+    def test_browser_observes_media_responses_during_initial_navigation(self):
+        factory, context, page, frame, url = self.browser_fixture()
+        frame.evaluate.return_value = []
+        response = MagicMock()
+        response.status = 200
+        response.url = url
+        response.request.frame.page = page
+        listeners = {}
+        context.on.side_effect = lambda event, callback: listeners.update(
+            {event: callback}
+        )
+        page.goto.side_effect = lambda *arguments, **kwargs: listeners["response"](
+            response
+        )
+        self.assertEqual(wait_for_source(context, page, start_url=page.url).url, url)
+
+    def test_missing_explicit_source_uses_browser_and_keeps_token_out_of_metadata(self):
+        factory, context, page, frame, url = self.browser_fixture()
+        arguments = ["clip", "--start", "10", "--end", "12", "--out", str(self.output)]
+        with patch(
+            "lecture_transcripts.cli.get_browser_source",
+            return_value=BrowserSource(url, page.url),
+        ) as browser:
+            with patch(
+                "lecture_transcripts.cli.run_command", side_effect=self.fake_media
+            ):
+                self.assertEqual(self.invoke(arguments), 0)
+        browser.assert_called_once()
+        metadata_text = self.output.with_suffix(".metadata.json").read_text()
+        self.assertNotIn("SECRET_TOKEN", metadata_text)
+        self.assertEqual(json.loads(metadata_text)["source_page"], page.url)
+
+    def test_existing_output_stops_before_browser_launch(self):
+        self.output.write_bytes(b"existing audio")
+        with patch("lecture_transcripts.cli.get_browser_source") as browser:
+            self.assertEqual(
+                self.invoke(
+                    ["clip", "--start", "10", "--end", "12", "--out", str(self.output)]
+                ),
+                1,
+            )
+        browser.assert_not_called()
 
     def test_missing_model_requires_explicit_download_permission(self):
         with patch(
@@ -371,6 +512,82 @@ class CliTests(unittest.TestCase):
                 1,
             )
         self.assertEqual(list(output_dir.iterdir()), [])
+
+
+@unittest.skipUnless(
+    os.environ.get("LECTURE_BROWSER_TESTS") == "1",
+    "Opt-in real browser tests require Playwright and a graphical session.",
+)
+class BrowserHarnessTests(unittest.TestCase):
+    def capture_fixture(self, mode):
+        from playwright.sync_api import sync_playwright
+
+        master = "https://ptz143.ust.hk/rvcsecured/mp4:fixture.mp4/playlist.m3u8?rvctokenendtime=4102444800&rvctokenhash=EXAMPLE_TOKEN"
+
+        @contextlib.contextmanager
+        def factory():
+            with sync_playwright() as driver:
+                launch = driver.chromium.launch_persistent_context
+
+                def launch_fixture(**arguments):
+                    context = launch(**arguments)
+
+                    def respond(route):
+                        if route.request.url == master:
+                            route.fulfill(
+                                status=200,
+                                content_type="application/vnd.apple.mpegurl",
+                                body="#EXTM3U\n#EXT-X-ENDLIST\n",
+                            )
+                        elif "/frame" in route.request.url:
+                            body = (
+                                "<script>setTimeout(() => { window.jwplayer = () => ({getPlaylist: () => [{sources: [{file: "
+                                + json.dumps(master)
+                                + "}]}]}); }, 600);</script>"
+                            )
+                            route.fulfill(
+                                status=200, content_type="text/html", body=body
+                            )
+                        else:
+                            body = (
+                                '<iframe src="/frame"></iframe>'
+                                if mode == "iframe-player"
+                                else "<script>setTimeout(() => fetch("
+                                + json.dumps(master)
+                                + "), 600);</script>"
+                            )
+                            route.fulfill(
+                                status=200, content_type="text/html", body=body
+                            )
+
+                    context.route("**/*", respond)
+                    return context
+
+                with patch.object(
+                    driver.chromium,
+                    "launch_persistent_context",
+                    side_effect=launch_fixture,
+                ):
+                    yield driver
+
+        with tempfile.TemporaryDirectory() as directory:
+            profile = Path(directory) / "profile"
+            with contextlib.redirect_stdout(io.StringIO()):
+                source = get_browser_source(
+                    start_url="https://canvas.ust.hk/browser-fixture",
+                    profile_dir=profile,
+                    timeout=10,
+                    sync_playwright_factory=factory,
+                )
+            self.assertEqual(source.url, master)
+            self.assertNotIn("EXAMPLE_TOKEN", repr(source))
+            self.assertEqual(profile.stat().st_mode & 0o777, 0o700)
+
+    def test_delayed_iframe_source_in_real_browser(self):
+        self.capture_fixture("iframe-player")
+
+    def test_delayed_media_response_in_real_browser(self):
+        self.capture_fixture("media-response")
 
 
 if __name__ == "__main__":

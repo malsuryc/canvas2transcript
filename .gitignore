@@ -1,5 +1,6 @@
 data/
 .venv/
+browser-profile*/
 transcripts/
 __pycache__/
 build/

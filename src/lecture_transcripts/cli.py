@@ -12,6 +12,8 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
+from .browser import MediaDiscoveryError, get_browser_source
+
 
 class CliError(Exception):
     pass
@@ -174,6 +176,7 @@ def clip_audio(options: argparse.Namespace) -> None:
         )
     metadata_path = output.with_suffix(".metadata.json")
     check_outputs([output, metadata_path], options.overwrite)
+    source_page = clean_source_page(options.source_page)
     if options.source_url_file:
         try:
             source = validate_url(
@@ -182,14 +185,25 @@ def clip_audio(options: argparse.Namespace) -> None:
         except (OSError, UnicodeError):
             raise CliError("Could not read --source-url-file.") from None
         source_identity = {"kind": "remote", "host": urlsplit(source).hostname}
-    else:
+    elif options.input:
         if not options.input.is_file():
             raise CliError("--input must be an existing local media file.")
         source = str(options.input.resolve())
         if output == options.input.resolve():
             raise CliError("Input and output must be different files.")
         source_identity = {"kind": "local", "filename": options.input.name}
-    source_page = clean_source_page(options.source_page)
+    else:
+        try:
+            captured = get_browser_source(
+                start_url=options.source_page or "https://canvas.ust.hk/",
+                profile_dir=options.browser_profile,
+                timeout=options.browser_timeout,
+            )
+        except MediaDiscoveryError as error:
+            raise CliError(str(error)) from None
+        source = validate_url(captured.url)
+        source_identity = {"kind": "remote", "host": urlsplit(source).hostname}
+        source_page = clean_source_page(captured.page_url)
     output.parent.mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
     with tempfile.TemporaryDirectory(
@@ -565,7 +579,7 @@ def build_parser() -> argparse.ArgumentParser:
     clip = commands.add_parser(
         "clip", help="Extract an audio section from signed media or a local file."
     )
-    source = clip.add_mutually_exclusive_group(required=True)
+    source = clip.add_mutually_exclusive_group()
     source.add_argument(
         "--source-url-file",
         type=Path,
@@ -593,7 +607,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     clip.add_argument(
         "--source-page",
-        help="Stable lecture page URL; query and fragment are not retained.",
+        help="Lecture page to open in browser mode; also used as metadata for explicit sources.",
+    )
+    clip.add_argument(
+        "--browser-profile",
+        type=Path,
+        help="Private helper-browser profile; default: ~/.local/state/lecture-transcripts/browser/.",
+    )
+    clip.add_argument(
+        "--browser-timeout",
+        type=positive_integer,
+        help="Maximum browser wait in seconds; default: wait until capture or cancellation.",
     )
     clip.add_argument(
         "--source-offset",
