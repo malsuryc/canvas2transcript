@@ -1,0 +1,15 @@
+data/
+.venv/
+transcripts/
+__pycache__/
+build/
+dist/
+*.egg-info/
+*.pdf
+*.m4a
+*.wav
+*.mp4
+*.part
+*.ytdl
+cookies*.txt
+source-url*.txt
